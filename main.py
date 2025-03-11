@@ -118,6 +118,11 @@ class LinkContractFileRequest(BaseModel):
     filename: str
 
 
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+
+
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
 
@@ -179,6 +184,26 @@ def check_role(current_user: dict, allowed_roles: list[Role]):
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You do not have permission to access this resource",
         )
+
+
+@app.post(API_V1_VERSION + "/register")
+async def register_user(register_request: RegisterRequest):
+    conn = await asyncpg.connect(DATABASE_URL)
+
+    existing_user = await conn.fetchrow('SELECT username FROM users WHERE username = $1', register_request.username)
+    if existing_user:
+        await conn.close()
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    hashed_password = pwd_context.hash(register_request.password)
+
+    await conn.execute('''
+        INSERT INTO users (username, hashed_password, role)
+        VALUES ($1, $2, $3)
+    ''', register_request.username, hashed_password, Role.USER)
+
+    await conn.close()
+    return {"message": "User registered successfully"}
 
 
 @app.post(API_V1_VERSION + "/token")
@@ -294,7 +319,6 @@ async def create_upload_abs_file(file: UploadFile = File(...), current_user: dic
         ''', file_content, existing_file['id'])
         message = "File updated successfully"
     else:
-
         await conn.execute('''
             INSERT INTO abs_files (filename, file_content)
             VALUES ($1, $2)
@@ -326,6 +350,7 @@ async def link_contract_file(link_request: LinkContractFileRequest, current_user
     check_role(current_user, [Role.BANK_WORKER, Role.ADMIN])
     conn = await asyncpg.connect(DATABASE_URL)
     try:
+
         contract = await conn.fetchrow('SELECT id FROM contracts WHERE contract_name = $1', link_request.contract_name)
         if not contract:
             raise HTTPException(status_code=404, detail="Contract not found")
