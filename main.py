@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from enum import Enum
 
 import asyncpg
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, status
@@ -20,10 +21,23 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 DATABASE_URL = "postgresql://postgres:123@localhost/pracDb"
 
 
+class Role(str, Enum):
+    USER = "user"
+    BANK_WORKER = "bank_worker"
+    ADMIN = "admin"
+
+
 async def init_db():
     conn = await asyncpg.connect(DATABASE_URL)
     await conn.execute('''
-        CREATE TABLE IF NOT EXISTS files (
+        CREATE TABLE IF NOT EXISTS abs_files (
+            id SERIAL PRIMARY KEY,
+            filename TEXT NOT NULL,
+            file_content BYTEA NOT NULL
+        )
+    ''')
+    await conn.execute('''
+        CREATE TABLE IF NOT EXISTS dbo_files (
             id SERIAL PRIMARY KEY,
             filename TEXT NOT NULL,
             file_content BYTEA NOT NULL
@@ -32,7 +46,21 @@ async def init_db():
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
-            hashed_password TEXT NOT NULL
+            hashed_password TEXT NOT NULL,
+            role TEXT NOT NULL
+        )
+    ''')
+    await conn.execute('''
+        CREATE TABLE IF NOT EXISTS contracts (
+            id SERIAL PRIMARY KEY,
+            contract_name TEXT NOT NULL UNIQUE
+        )
+    ''')
+    await conn.execute('''
+        CREATE TABLE IF NOT EXISTS contract_files (
+            contract_id INT REFERENCES contracts(id) ON DELETE CASCADE,
+            file_id INT REFERENCES abs_files(id) ON DELETE CASCADE,
+            PRIMARY KEY (contract_id, file_id)
         )
     ''')
     await conn.close()
@@ -40,10 +68,25 @@ async def init_db():
 
 async def create_master_user():
     conn = await asyncpg.connect(DATABASE_URL)
-    user = await conn.fetchrow('SELECT username FROM users WHERE username = $1', "admin")
-    if not user:
+
+    admin = await conn.fetchrow('SELECT username FROM users WHERE username = $1', "admin")
+    if not admin:
         hashed_password = pwd_context.hash("admin")
-        await conn.execute('INSERT INTO users (username, hashed_password) VALUES ($1, $2)', "admin", hashed_password)
+        await conn.execute('INSERT INTO users (username, hashed_password, role) VALUES ($1, $2, $3)',
+                           "admin", hashed_password, Role.ADMIN)
+
+    user = await conn.fetchrow('SELECT username FROM users WHERE username = $1', "user")
+    if not user:
+        hashed_password = pwd_context.hash("user")
+        await conn.execute('INSERT INTO users (username, hashed_password, role) VALUES ($1, $2, $3)',
+                           "user", hashed_password, Role.USER)
+
+    bank_worker = await conn.fetchrow('SELECT username FROM users WHERE username = $1', "bank_worker")
+    if not bank_worker:
+        hashed_password = pwd_context.hash("bank_worker")
+        await conn.execute('INSERT INTO users (username, hashed_password, role) VALUES ($1, $2, $3)',
+                           "bank_worker", hashed_password, Role.BANK_WORKER)
+
     await conn.close()
 
 
@@ -52,6 +95,7 @@ async def lifespan(app: FastAPI):
     await init_db()
     await create_master_user()
     yield
+
     pass
 
 
@@ -65,16 +109,29 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class CreateContractRequest(BaseModel):
+    contract_name: str
+
+
+class LinkContractFileRequest(BaseModel):
+    contract_name: str
+    filename: str
+
+
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
 
 
 async def get_user(username: str):
     conn = await asyncpg.connect(DATABASE_URL)
-    user_record = await conn.fetchrow('SELECT username, hashed_password FROM users WHERE username = $1', username)
+    user_record = await conn.fetchrow('SELECT username, hashed_password, role FROM users WHERE username = $1', username)
     await conn.close()
     if user_record:
-        return {"username": user_record['username'], "hashed_password": user_record['hashed_password']}
+        return {
+            "username": user_record['username'],
+            "hashed_password": user_record['hashed_password'],
+            "role": user_record['role']
+        }
 
 
 async def authenticate_user(username: str, password: str):
@@ -116,6 +173,14 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     return user
 
 
+def check_role(current_user: dict, allowed_roles: list[Role]):
+    if current_user["role"] not in allowed_roles:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to access this resource",
+        )
+
+
 @app.post(API_V1_VERSION + "/token")
 async def login(login_request: LoginRequest):
     user = await authenticate_user(login_request.username, login_request.password)
@@ -132,18 +197,20 @@ async def login(login_request: LoginRequest):
     return {"access_token": access_token, "token_type": "bearer"}
 
 
-@app.get(API_V1_VERSION + "/files")
-async def list_files(current_user: dict = Depends(get_current_user)):
+@app.get(API_V1_VERSION + "/dbo/files")
+async def list_dbo_files(current_user: dict = Depends(get_current_user)):
+    check_role(current_user, [Role.USER, Role.ADMIN])
     conn = await asyncpg.connect(DATABASE_URL)
-    files = await conn.fetch('SELECT filename FROM files')
+    files = await conn.fetch('SELECT filename FROM dbo_files')
     await conn.close()
     return {"files": [file['filename'] for file in files]}
 
 
-@app.get(API_V1_VERSION + "/files/{filename}")
-async def get_file_by_name(filename: str, current_user: dict = Depends(get_current_user)):
+@app.get(API_V1_VERSION + "/dbo/files/{filename}")
+async def get_dbo_file_by_name(filename: str, current_user: dict = Depends(get_current_user)):
+    check_role(current_user, [Role.USER, Role.ADMIN])
     conn = await asyncpg.connect(DATABASE_URL)
-    file_record = await conn.fetchrow('SELECT filename, file_content FROM files WHERE filename = $1', filename)
+    file_record = await conn.fetchrow('SELECT filename, file_content FROM dbo_files WHERE filename = $1', filename)
     await conn.close()
     if file_record:
         filename, file_content = file_record['filename'], file_record['file_content']
@@ -156,26 +223,131 @@ async def get_file_by_name(filename: str, current_user: dict = Depends(get_curre
         raise HTTPException(status_code=404, detail="File not found")
 
 
-@app.post(API_V1_VERSION + "/uploadfile")
-async def create_upload_file(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+@app.post(API_V1_VERSION + "/dbo/uploadfile")
+async def create_upload_dbo_file(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    check_role(current_user, [Role.USER, Role.ADMIN])
     file_content = await file.read()
     conn = await asyncpg.connect(DATABASE_URL)
 
-    existing_file = await conn.fetchrow('SELECT id FROM files WHERE filename = $1', file.filename)
+    existing_file = await conn.fetchrow('SELECT id FROM dbo_files WHERE filename = $1', file.filename)
 
     if existing_file:
+
         await conn.execute('''
-            UPDATE files
+            UPDATE dbo_files
             SET file_content = $1
             WHERE id = $2
         ''', file_content, existing_file['id'])
         message = "File updated successfully"
     else:
+
         await conn.execute('''
-            INSERT INTO files (filename, file_content)
+            INSERT INTO dbo_files (filename, file_content)
             VALUES ($1, $2)
         ''', file.filename, file_content)
         message = "File uploaded successfully"
 
     await conn.close()
     return {"filename": file.filename, "message": message}
+
+
+@app.get(API_V1_VERSION + "/abs/files")
+async def list_abs_files(current_user: dict = Depends(get_current_user)):
+    check_role(current_user, [Role.BANK_WORKER, Role.ADMIN])
+    conn = await asyncpg.connect(DATABASE_URL)
+    files = await conn.fetch('SELECT filename FROM abs_files')
+    await conn.close()
+    return {"files": [file['filename'] for file in files]}
+
+
+@app.get(API_V1_VERSION + "/abs/files/{filename}")
+async def get_abs_file_by_name(filename: str, current_user: dict = Depends(get_current_user)):
+    check_role(current_user, [Role.BANK_WORKER, Role.ADMIN])
+    conn = await asyncpg.connect(DATABASE_URL)
+    file_record = await conn.fetchrow('SELECT filename, file_content FROM abs_files WHERE filename = $1', filename)
+    await conn.close()
+    if file_record:
+        filename, file_content = file_record['filename'], file_record['file_content']
+        return StreamingResponse(
+            iter([file_content]),
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    else:
+        raise HTTPException(status_code=404, detail="File not found")
+
+
+@app.post(API_V1_VERSION + "/abs/uploadfile")
+async def create_upload_abs_file(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    check_role(current_user, [Role.BANK_WORKER, Role.ADMIN])
+    file_content = await file.read()
+    conn = await asyncpg.connect(DATABASE_URL)
+
+    existing_file = await conn.fetchrow('SELECT id FROM abs_files WHERE filename = $1', file.filename)
+
+    if existing_file:
+
+        await conn.execute('''
+            UPDATE abs_files
+            SET file_content = $1
+            WHERE id = $2
+        ''', file_content, existing_file['id'])
+        message = "File updated successfully"
+    else:
+
+        await conn.execute('''
+            INSERT INTO abs_files (filename, file_content)
+            VALUES ($1, $2)
+        ''', file.filename, file_content)
+        message = "File uploaded successfully"
+
+    await conn.close()
+    return {"filename": file.filename, "message": message}
+
+
+@app.post(API_V1_VERSION + "/sm/create_contract")
+async def create_contract(contract_request: CreateContractRequest, current_user: dict = Depends(get_current_user)):
+    check_role(current_user, [Role.BANK_WORKER, Role.ADMIN])
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute('''
+            INSERT INTO contracts (contract_name)
+            VALUES ($1)
+        ''', contract_request.contract_name)
+        return {"message": "Contract created successfully"}
+    except asyncpg.UniqueViolationError:
+        raise HTTPException(status_code=400, detail="Contract with this name already exists")
+    finally:
+        await conn.close()
+
+
+@app.post(API_V1_VERSION + "/sm/link")
+async def link_contract_file(link_request: LinkContractFileRequest, current_user: dict = Depends(get_current_user)):
+    check_role(current_user, [Role.BANK_WORKER, Role.ADMIN])
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        contract = await conn.fetchrow('SELECT id FROM contracts WHERE contract_name = $1', link_request.contract_name)
+        if not contract:
+            raise HTTPException(status_code=404, detail="Contract not found")
+
+        file = await conn.fetchrow('SELECT id FROM abs_files WHERE filename = $1', link_request.filename)
+        if not file:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        existing_link = await conn.fetchrow('''
+            SELECT contract_id, file_id 
+            FROM contract_files 
+            WHERE contract_id = $1 AND file_id = $2
+        ''', contract['id'], file['id'])
+
+        if existing_link:
+            return {"message": "The link between the contract and the file already exists"}
+
+        await conn.execute('''
+            INSERT INTO contract_files (contract_id, file_id)
+            VALUES ($1, $2)
+        ''', contract['id'], file['id'])
+
+        return {"message": "Contract and file linked successfully"}
+    finally:
+        await conn.close()
